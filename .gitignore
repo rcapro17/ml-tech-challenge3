@@ -1,0 +1,29 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.dist/
+build/
+.eggs/
+
+# env
+.env
+.venv/
+venv/
+
+# data/artifacts
+data/
+models/
+.dvc/
+mlruns/
+
+# editors
+.vscode/
+.idea/
+
+data/models/
+data/feature_store/
+data/raw/
+scripts/collect_daily.log

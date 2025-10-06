@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ title or "ML Tech Challenge" }}</title>
+
+    <!-- Tailwind (CDN) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Plotly -->
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <!-- HTMX (opcional; o dashboard funciona sem) -->
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+
+    <style>
+      /* Card sem @apply (CDN do Tailwind não processa @apply em runtime) */
+      .card {
+        background: #ffffff;
+        border-radius: 1rem; /* ~ rounded-2xl */
+        border: 1px solid #f1f5f9; /* slate-100 */
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 4px 8px rgba(0, 0, 0, 0.04);
+      }
+      .card-header {
+        padding: 1.25rem 1.5rem 0.25rem 1.5rem; /* px-6 pt-5 */
+        color: #1f2937; /* gray-800 */
+        font-weight: 600;
+      }
+      .card-body {
+        padding: 0.5rem 1.5rem 1.5rem 1.5rem; /* pt-2 px-6 pb-6 */
+      }
+    </style>
+
+    {% block head %}{% endblock %}
+  </head>
+
+  <body class="bg-gray-50 text-gray-800">
+    <header class="max-w-7xl mx-auto px-4 py-6">
+      <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-bold">ML Tech Challenge — Dashboard</h1>
+        <div class="text-sm text-gray-500">{{ subtitle or "" }}</div>
+      </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 pb-10">
+      {% block content %}{% endblock %}
+    </main>
+
+    {% block scripts %}{% endblock %}
+
+    <!-- Handlers úteis p/ depurar HTMX (opcional) -->
+    <script>
+      document.body.addEventListener("htmx:responseError", (e) =>
+        console.error(
+          "HTMX response error",
+          e.detail.xhr.status,
+          e.detail.xhr.responseText
+        )
+      );
+      document.body.addEventListener("htmx:send", () =>
+        console.log("HTMX: request started")
+      );
+      document.body.addEventListener("htmx:afterOnLoad", () =>
+        console.log("HTMX: request finished")
+      );
+    </script>
+  </body>
+</html>

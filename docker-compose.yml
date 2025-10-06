@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: mltech-postgres
+    environment:
+      POSTGRES_DB: mltech
+      POSTGRES_USER: mluser
+      POSTGRES_PASSWORD: mlpass
+      TZ: America/Sao_Paulo
+    ports:
+      - "5432:5432"        # se conflitar, troque para "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mluser -d mltech"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  adminer:
+    image: adminer:4
+    container_name: mltech-adminer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:

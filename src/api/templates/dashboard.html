@@ -1,0 +1,281 @@
+{% extends "base.html" %} {% block head %}
+<meta name="htmx-config" content='{"useTemplateFragments": true}' />
+<style>
+  /* Spinner circular */
+  .spin {
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>
+{% endblock %} {% block content %}
+<div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+  <!-- Coluna principal -->
+  <div class="md:col-span-3 card">
+    <div class="card-header">Histórico & Previsão</div>
+    <div class="card-body">
+      <div class="flex flex-wrap items-center gap-3 mb-4">
+        <label class="text-sm text-gray-600">Série (SGS code):</label>
+        <input
+          id="series-code"
+          class="px-3 py-2 rounded-lg border border-gray-300 text-sm"
+          type="text"
+          value="{{ default_code }}" />
+
+        <button
+          id="btn-refresh"
+          type="button"
+          class="px-4 py-2 rounded-xl bg-blue-600 text-white text-sm hover:bg-blue-700 cursor-pointer">
+          Atualizar
+        </button>
+
+        <button
+          id="btn-tune"
+          type="button"
+          class="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm hover:bg-emerald-700 cursor-pointer"
+          onclick="runTune()">
+          Rodar Tuning Agora
+        </button>
+
+        <!-- Indicador com spinner (controlado via JS) -->
+        <span
+          id="tune-indicator"
+          class="inline-flex items-center gap-2 text-sm text-gray-600"
+          style="display: none">
+          <svg
+            class="spin h-5 w-5 text-emerald-600"
+            viewBox="0 0 24 24"
+            fill="none">
+            <circle
+              class="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              stroke-width="4"></circle>
+            <path
+              class="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8v4A4 4 0 008 12H4z"></path>
+          </svg>
+          <span>Processando…</span>
+        </span>
+
+        <!-- Mensagem de sucesso/erro do tuning (HTML vindo do backend) -->
+        <div id="tune-result" class="text-sm text-gray-700"></div>
+      </div>
+
+      <!-- Gráfico -->
+      <div id="chart" class="w-full" style="height: 460px"></div>
+      <div class="text-xs text-gray-500 mt-2">
+        Histórico (azul) e previsão do último modelo salvo (laranja tracejada).
+      </div>
+    </div>
+  </div>
+
+  <!-- Coluna lateral -->
+  <div class="md:col-span-1 space-y-6">
+    <div class="card">
+      <div class="card-header">Métricas (último modelo)</div>
+      <div class="card-body">
+        <div id="metrics" class="text-sm space-y-1 text-gray-700">
+          <div>
+            <span class="font-medium">MAE:</span> <span id="m-mae">—</span>
+          </div>
+          <div>
+            <span class="font-medium">RMSE:</span> <span id="m-rmse">—</span>
+          </div>
+          <div>
+            <span class="font-medium">MAPE:</span> <span id="m-mape">—</span>
+          </div>
+          <div>
+            <span class="font-medium">n pontos:</span> <span id="m-n">—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Modelo</div>
+      <div class="card-body text-sm text-gray-700 space-y-1">
+        <div>
+          <span class="font-medium">Order:</span> <span id="m-order">—</span>
+        </div>
+        <div>
+          <span class="font-medium">Seasonal:</span>
+          <span id="m-seasonal">—</span>
+        </div>
+        <div>
+          <span class="font-medium">Run:</span> <span id="m-run">—</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %} {% block scripts %}
+<script>
+  // Utilitário json
+  async function fetchJSON(url, options) {
+    const r = await fetch(url, options || {});
+    if (!r.ok) throw new Error(await r.text());
+    return await r.json();
+  }
+
+  async function loadDashboard(code) {
+    // Histórico
+    const hist = await fetchJSON(
+      `/v1/history?code=${encodeURIComponent(code)}&freq=B`
+    );
+    // Forecast (último modelo salvo)
+    const fc = await fetchJSON(
+      `/v1/forecast_latest?code=${encodeURIComponent(code)}&h=15&freq=B`
+    );
+    // Info do último modelo
+    const info = await fetchJSON(
+      `/v1/last_model_info?code=${encodeURIComponent(code)}&freq=B`
+    );
+
+    // Plotly — histórico
+    const histTrace = {
+      x: hist.map((d) => d.ts),
+      y: hist.map((d) => d.value),
+      mode: "lines",
+      name: "Histórico",
+      line: { width: 2 },
+    };
+
+    // Plotly — previsão
+    const fcTrace = {
+      x: fc.map((d) => d.ts),
+      y: fc.map((d) => d.yhat),
+      mode: "lines",
+      name: "Previsão",
+      line: { width: 2, dash: "dash" },
+    };
+
+    Plotly.newPlot(
+      "chart",
+      [histTrace, fcTrace],
+      {
+        margin: { t: 30, r: 10, b: 40, l: 50 },
+        legend: { orientation: "h" },
+        xaxis: { title: "Data" },
+        yaxis: { title: "Valor" },
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
+      },
+      { responsive: true }
+    );
+
+    // Atualiza cards
+    const m = info.metrics || {};
+    document.getElementById("m-mae").textContent = (m.MAE ?? "—").toFixed
+      ? m.MAE.toFixed(4)
+      : m.MAE;
+    document.getElementById("m-rmse").textContent = (m.RMSE ?? "—").toFixed
+      ? m.RMSE.toFixed(4)
+      : m.RMSE;
+    document.getElementById("m-mape").textContent = (m.MAPE ?? "—").toFixed
+      ? m.MAPE.toFixed(2) + "%"
+      : m.MAPE;
+    document.getElementById("m-n").textContent = m.n_fold_points ?? "—";
+
+    document.getElementById("m-order").textContent = info.order ?? "—";
+    document.getElementById("m-seasonal").textContent =
+      info.seasonal_order ?? "—";
+    document.getElementById("m-run").textContent = info.run ?? "—";
+  }
+
+  // Exposta globalmente pro onclick do botão
+  window.runTune = async function runTune() {
+    const code = document.getElementById("series-code").value.trim();
+    const indicator = document.getElementById("tune-indicator");
+    const result = document.getElementById("tune-result");
+    const btnTune = document.getElementById("btn-tune");
+    const btnRef = document.getElementById("btn-refresh");
+
+    result.textContent = "";
+    indicator.style.display = "inline-flex"; // mostra spinner
+    btnTune.disabled = true;
+    btnTune.classList.add("opacity-60", "cursor-not-allowed");
+
+    try {
+      const body = new URLSearchParams({
+        code,
+        freq: "B",
+        horizon: 5,
+        init_ratio: 0.7,
+      });
+
+      const resp = await fetch("/v1/tune_train", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "text/html", // força resposta HTML
+          "HX-Request": "true", // também ativa o bloco de HTML no backend
+        },
+        body,
+      });
+
+      const text = await resp.text();
+      if (!resp.ok) {
+        result.innerHTML = `<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-red-700">
+          <div class="font-semibold">Falha no tuning</div>
+          <pre class="mt-1 text-xs overflow-auto">${text.replace(
+            /[<>&]/g,
+            (s) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[s])
+          )}</pre>
+        </div>`;
+      } else {
+        result.innerHTML = text; // HTML “✓ Tuning concluído…”
+        // Toast curtinho
+        const toast = document.createElement("div");
+        toast.className =
+          "fixed bottom-4 right-4 px-4 py-3 pr-10 rounded-lg bg-emerald-600 text-white shadow-lg";
+        toast.innerHTML = `
+  <span>Modelo atualizado com sucesso!</span>
+  <button type="button"
+          aria-label="Fechar"
+          class="absolute top-1 right-2 text-white/80 hover:text-white text-xl leading-none"
+          onclick="this.parentElement.remove()">
+    &times;
+  </button>
+`;
+        document.body.appendChild(toast);
+        setTimeout(() => toast?.remove(), 4000);
+
+        // redesenha gráfico/cards
+        btnRef.click();
+      }
+    } catch (err) {
+      console.error("[runTune] error", err);
+      result.innerHTML = `<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-red-700">
+        Erro inesperado ao rodar tuning.
+      </div>`;
+    } finally {
+      indicator.style.display = "none"; // esconde spinner
+      btnTune.disabled = false;
+      btnTune.classList.remove("opacity-60", "cursor-not-allowed");
+    }
+  };
+
+  // Atualizar → redesenha tudo
+  document.getElementById("btn-refresh").addEventListener("click", () => {
+    const code = document.getElementById("series-code").value.trim();
+    loadDashboard(code).catch((err) =>
+      console.error("[loadDashboard] error", err)
+    );
+  });
+
+  // Carrega ao abrir a página
+  window.addEventListener("load", () => {
+    const code = document.getElementById("series-code").value.trim();
+    loadDashboard(code).catch((err) =>
+      console.error("[initial load] error", err)
+    );
+  });
+</script>
+{% endblock %}
