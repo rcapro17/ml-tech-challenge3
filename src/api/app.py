@@ -1,6 +1,8 @@
 # IMPORTS ABSOLUTOS (melhor para a aplicação rodando como WSGI)
 from flask import Flask, request, jsonify, render_template_string, render_template
 import pandas as pd
+from datetime import date, timedelta
+from pathlib import Path
 
 from src.db import ping_db
 from src.data.collectors.sgs_client import fetch_sgs_series
@@ -67,6 +69,47 @@ def collect_sgs():
             summary.append({"code": code, "db_upserts": n_db, "lake_rows": n_lake})
 
         return jsonify({"ok": True, "summary": summary})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+    
+
+# exemplo bem direto; adapte para sua função real de build
+@app.post("/v1/build_features")
+def build_features_endpoint():
+    try:
+        payload = request.get_json(silent=True) or {}
+        codes = payload.get("codes") or []
+        if not codes:
+            return jsonify({"ok": False, "error": "informe 'codes'"}), 400
+
+        out = []
+        for code in codes:
+            code = str(code)
+            # 1) leia do lake (parquet) OU do DB
+            # Exemplo via lake parquet (ajuste caminho conforme seu writer):
+            lake_path = Path(f"data/raw/source=SGS/{code}.parquet")
+            if not lake_path.exists():
+                # se não existir parquet, tente buscar do DB:
+                df = load_series(code)  # se esta função lê do DB, OK
+            else:
+                df = pd.read_parquet(lake_path)
+
+            if df is None or df.empty:
+                out.append({"code": code, "written": 0, "reason": "sem dados no lake/DB"})
+                continue
+
+            # 2) faça o processamento de features (resample, ffill, etc.)
+            s = (df.set_index("ts")["value"]
+                   .asfreq("B", method="ffill")
+                   .dropna()
+                   .rename("value"))
+            fs_dir = Path("data/feature_store/source=SGS")
+            fs_dir.mkdir(parents=True, exist_ok=True)
+            s.to_frame().reset_index().to_parquet(fs_dir / f"{code}.parquet", index=False)
+            out.append({"code": code, "written": int(s.size)})
+
+        return jsonify({"ok": True, "summary": out})
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -287,6 +330,32 @@ def last_model_info():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+@app.before_first_request
+def bootstrap_if_empty():
+    """
+    Preenche a série '1' se o histórico estiver vazio (útil no primeiro deploy).
+    É idempotente: se já existir dado, não faz nada.
+    """
+    try:
+        df = load_series("1")
+        if df is not None and not df.empty:
+            print("[bootstrap] Série 1 já possui histórico, nada a fazer.", flush=True)
+            return
+
+        end = (date.today() - timedelta(days=1)).isoformat()  # evita pedir futuro ao BCB
+        print(f"[bootstrap] Sem histórico. Coletando SGS 1 até {end}...", flush=True)
+
+        # garante que a série existe na tabela 'series'
+        upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
+
+        # baixa e grava observações
+        rows = fetch_sgs_series("1", "2010-01-01", end)
+        n = insert_observations("1", rows)
+        print(f"[bootstrap] Inseridas/atualizadas {n} observações da série 1.", flush=True)
+
+    except Exception as e:
+        print("[bootstrap] erro:", e, flush=True)
 
 
 if __name__ == "__main__":
