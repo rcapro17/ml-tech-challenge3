@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request, render_template, render_template_string, abort
 import pandas as pd
 
-# IMPORTS RELATIVOS (note os dois pontos)
+# IMPORTS RELATIVOS (preferível em app dentro de pacote)
 from ..db import ping_db
 from ..data.collectors.sgs_client import fetch_sgs_series
 from ..data.warehouse import upsert_series, insert_observations
@@ -15,6 +15,7 @@ from ..ml.registry import (
 )
 from ..ml.tuning import tune_sarimax_for_code
 from ..ml.etl import load_series
+
 
 
 app = Flask(__name__)
