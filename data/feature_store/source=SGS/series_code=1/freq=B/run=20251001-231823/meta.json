@@ -1,0 +1,23 @@
+{
+  "code": "1",
+  "freq": "B",
+  "lags": 7,
+  "train_ratio": 0.8,
+  "n_rows": 711,
+  "n_train": 568,
+  "n_test": 143,
+  "columns": [
+    "ts",
+    "value",
+    "lag1",
+    "lag2",
+    "lag3",
+    "lag4",
+    "lag5",
+    "lag6",
+    "lag7",
+    "split"
+  ],
+  "dataset_path": "data/feature_store/source=SGS/series_code=1/freq=B/run=20251001-231823/dataset.parquet",
+  "run_id": "20251001-231823"
+}
