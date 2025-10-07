@@ -1,7 +1,7 @@
 # IMPORTS ABSOLUTOS (melhor para a aplicação rodando como WSGI)
 from flask import Flask, request, jsonify, render_template_string, render_template
 import pandas as pd
-from datetime import date, timedelta 
+from datetime import date, timedelta
 from pathlib import Path
 import os
 
@@ -19,15 +19,14 @@ from src.ml.registry import (
 from src.ml.tuning import tune_sarimax_for_code
 from src.ml.etl import load_series
 
-
 app = Flask(__name__)
- 
-# --- BOOTSTRAP "RUN-ONCE" COMPATÍVEL ---
+
+# --- BOOTSTRAP "RUN-ONCE" COMPATÍVEL COM FLASK 3 ---
 _BOOTSTRAP_FLAG = "_BOOTSTRAP_DONE"
-_bootstrapped = False  # flag em memória
+_bootstrapped = False
 
 def _bootstrap_if_empty():
-    """Sem redeclarar decorators raros. Roda rápido e só 1x."""
+    """Executa 1x: se série '1' não tiver histórico, coleta e grava."""
     if os.environ.get(_BOOTSTRAP_FLAG) == "1":
         return
     try:
@@ -37,13 +36,17 @@ def _bootstrap_if_empty():
             rows = fetch_sgs_series("1", "2010-01-01", end)
             upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
             insert_observations("1", rows)
+            print(f"[bootstrap] Série 1 populada até {end}.", flush=True)
+        else:
+            print("[bootstrap] Série 1 já possui histórico.", flush=True)
         os.environ[_BOOTSTRAP_FLAG] = "1"
-        print("Bootstrap concluído (ou já existia).", flush=True)
     except Exception as e:
-        print("bootstrap error:", e, flush=True)
+        # Não deve derrubar o app se falhar; apenas loga e segue
+        print("[bootstrap] erro:", e, flush=True)
 
 @app.before_request
 def _ensure_bootstrap_once():
+    """Rodará no primeiro request de cada worker; depois fica no-op."""
     global _bootstrapped
     if not _bootstrapped:
         _bootstrap_if_empty()
@@ -59,9 +62,8 @@ def health_db():
     code = 200 if ok else 500
     return jsonify({"db_ok": ok}), code
 
-
 # ------------------------------
-# NOVA ROTA: /v1/collect/sgs
+# /v1/collect/sgs
 # ------------------------------
 @app.post("/v1/collect/sgs")
 def collect_sgs():
@@ -99,31 +101,28 @@ def collect_sgs():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
-    
 
+# seed rápido para dev (opcional)
 @app.post("/v1/dev/seed")
 def dev_seed():
     try:
         payload = request.get_json(silent=True) or {}
         codes = payload.get("codes") or ["1"]
         start = payload.get("start") or "2010-01-01"
-        from datetime import date, timedelta
         end = payload.get("end") or (date.today() - timedelta(days=1)).isoformat()
 
         summary = []
         for code in codes:
-            upsert_series(str(code), source="SGS", name="USD/BRL PTAX venda", frequency="daily")
-            rows = fetch_sgs_series(str(code), start, end)
-            n = insert_observations(str(code), rows)
-            summary.append({"code": str(code), "db_upserts": n})
+            code = str(code)
+            upsert_series(code, source="SGS", name="USD/BRL PTAX venda", frequency="daily")
+            rows = fetch_sgs_series(code, start, end)
+            n = insert_observations(code, rows)
+            summary.append({"code": code, "db_upserts": n})
         return jsonify({"ok": True, "summary": summary})
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    
-
-# exemplo bem direto; adapte para sua função real de build
 @app.post("/v1/build_features")
 def build_features_endpoint():
     try:
@@ -133,22 +132,17 @@ def build_features_endpoint():
             return jsonify({"ok": False, "error": "informe 'codes'"}), 400
 
         out = []
-        for code in codes:
-            code = str(code)
-            # 1) leia do lake (parquet) OU do DB
-            # Exemplo via lake parquet (ajuste caminho conforme seu writer):
+        for code in map(str, codes):
             lake_path = Path(f"data/raw/source=SGS/{code}.parquet")
-            if not lake_path.exists():
-                # se não existir parquet, tente buscar do DB:
-                df = load_series(code)  # se esta função lê do DB, OK
-            else:
+            if lake_path.exists():
                 df = pd.read_parquet(lake_path)
+            else:
+                df = load_series(code)
 
             if df is None or df.empty:
                 out.append({"code": code, "written": 0, "reason": "sem dados no lake/DB"})
                 continue
 
-            # 2) faça o processamento de features (resample, ffill, etc.)
             s = (df.set_index("ts")["value"]
                    .asfreq("B", method="ffill")
                    .dropna()
@@ -162,20 +156,9 @@ def build_features_endpoint():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
-    
-
 
 @app.post("/v1/predict")
 def predict():
-    """
-    Body:
-    {
-      "code": "10844",
-      "h": 5,                    # horizonte (dias úteis)
-      "order": [1,1,1],          # opcional
-      "seasonal_order": [0,0,0,0]# opcional
-    }
-    """
     try:
         payload = request.get_json(silent=True) or {}
         code = str(payload.get("code", "")).strip()
@@ -205,7 +188,7 @@ def predict():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
-    
+
 @app.post("/v1/predict_latest")
 def predict_latest():
     try:
@@ -260,35 +243,32 @@ def tune_train():
             }
         )
 
-        # >>> Se o cliente pede HTML (HTMX ou Accept: text/html), retorna um bloco pronto pra injetar no DOM
         accepts_html = "text/html" in (request.headers.get("Accept", "") or "")
         if request.headers.get("HX-Request") == "true" or accepts_html:
             return render_template_string(
-    """
-    <div class="flash-success relative p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
-      <button type="button" aria-label="Fechar"
-              class="absolute top-2 right-2 text-emerald-700 hover:text-emerald-900"
-              onclick="this.closest('.flash-success').remove()">
-        &times;
-      </button>
+                """
+                <div class="flash-success relative p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
+                  <button type="button" aria-label="Fechar"
+                          class="absolute top-2 right-2 text-emerald-700 hover:text-emerald-900"
+                          onclick="this.closest('.flash-success').remove()">
+                    &times;
+                  </button>
 
-      <div class="font-semibold">✓ Tuning concluído</div>
-      <div class="mt-1 text-sm">
-        <span class="font-medium">RMSE:</span> {{ rmse|round(4) }} |
-        <span class="font-medium">order:</span> {{ order }} |
-        <span class="font-medium">seasonal:</span> {{ seasonal }}
-      </div>
-      <div class="mt-1 text-xs text-gray-600 break-all">run: {{ run }}</div>
-    </div>
-    """,
-    rmse=best["metrics"]["RMSE"],
-    order=best["order"],
-    seasonal=best["seasonal_order"],
-    run=run_dir
-)
+                  <div class="font-semibold">✓ Tuning concluído</div>
+                  <div class="mt-1 text-sm">
+                    <span class="font-medium">RMSE:</span> {{ rmse|round(4) }} |
+                    <span class="font-medium">order:</span> {{ order }} |
+                    <span class="font-medium">seasonal:</span> {{ seasonal }}
+                  </div>
+                  <div class="mt-1 text-xs text-gray-600 break-all">run: {{ run }}</div>
+                </div>
+                """,
+                rmse=best["metrics"]["RMSE"],
+                order=best["order"],
+                seasonal=best["seasonal_order"],
+                run=run_dir
+            )
 
-
-        # >>> Caso contrário, API JSON “crua”
         return jsonify({
             "ok": True,
             "best": {"order": best["order"], "seasonal_order": best["seasonal_order"], "metrics": best["metrics"]},
@@ -299,13 +279,10 @@ def tune_train():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
-
-
 @app.get("/dashboard")
 def dashboard():
-    # página HTML
-    return render_template("dashboard.html", title="Dashboard", subtitle="SGS → Lake → Feature Store → Modelo",
+    return render_template("dashboard.html", title="Dashboard",
+                           subtitle="SGS → Lake → Feature Store → Modelo",
                            default_code="1")
 
 @app.get("/v1/history")
@@ -322,16 +299,15 @@ def history():
             out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
             return jsonify(out)
 
-        # FALLBACK: se não tem dados no warehouse, use a série do último modelo salvo
         model, _ = load_latest_model(code, freq)
         if model is not None:
-            import pandas as pd
-            y = pd.Series(model.data.endog, index=pd.to_datetime(model.data.row_labels), name="value")
+            y = pd.Series(model.data.endog,
+                          index=pd.to_datetime(model.data.row_labels),
+                          name="value")
             s = y.asfreq(freq, method="ffill").dropna()
             out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
             return jsonify(out)
 
-        # se não tiver nada mesmo:
         return jsonify([])
 
     except Exception as e:
@@ -340,9 +316,6 @@ def history():
 
 @app.get("/v1/forecast_latest")
 def forecast_latest():
-    """
-    Retorna forecast do último modelo salvo: /v1/forecast_latest?code=1&h=15&freq=B
-    """
     try:
         code = str(request.args.get("code", "")).strip()
         h = int(request.args.get("h", 15))
@@ -365,9 +338,6 @@ def forecast_latest():
 
 @app.get("/v1/last_model_info")
 def last_model_info():
-    """
-    Info do último modelo salvo (metrics, order, seasonal, run dir): /v1/last_model_info?code=1&freq=B
-    """
     try:
         code = str(request.args.get("code", "")).strip()
         freq = str(request.args.get("freq", "B"))
@@ -386,33 +356,6 @@ def last_model_info():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
-@app.before_first_request
-def bootstrap_if_empty():
-    """
-    Preenche a série '1' se o histórico estiver vazio (útil no primeiro deploy).
-    É idempotente: se já existir dado, não faz nada.
-    """
-    try:
-        df = load_series("1")
-        if df is not None and not df.empty:
-            print("[bootstrap] Série 1 já possui histórico, nada a fazer.", flush=True)
-            return
-
-        end = (date.today() - timedelta(days=1)).isoformat()  # evita pedir futuro ao BCB
-        print(f"[bootstrap] Sem histórico. Coletando SGS 1 até {end}...", flush=True)
-
-        # garante que a série existe na tabela 'series'
-        upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
-
-        # baixa e grava observações
-        rows = fetch_sgs_series("1", "2010-01-01", end)
-        n = insert_observations("1", rows)
-        print(f"[bootstrap] Inseridas/atualizadas {n} observações da série 1.", flush=True)
-
-    except Exception as e:
-        print("[bootstrap] erro:", e, flush=True)
-
-
 if __name__ == "__main__":
+    # Em dev local
     app.run(host="0.0.0.0", port=8000, debug=False)
