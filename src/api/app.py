@@ -22,30 +22,32 @@ from src.ml.etl import load_series
 
 app = Flask(__name__)
  
+# --- BOOTSTRAP "RUN-ONCE" COMPATÍVEL ---
 _BOOTSTRAP_FLAG = "_BOOTSTRAP_DONE"
+_bootstrapped = False  # flag em memória
 
 def _bootstrap_if_empty():
+    """Sem redeclarar decorators raros. Roda rápido e só 1x."""
     if os.environ.get(_BOOTSTRAP_FLAG) == "1":
         return
     try:
-        df = load_series("1")  # lê do seu warehouse/feature_store
+        df = load_series("1")
         if df is None or df.empty:
             end = (date.today() - timedelta(days=1)).isoformat()
             rows = fetch_sgs_series("1", "2010-01-01", end)
             upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
             insert_observations("1", rows)
-            # se seu /v1/history depende de feature_store, gere aqui também
-            # (opcional) ex.: build_features_para_code("1")
         os.environ[_BOOTSTRAP_FLAG] = "1"
-        print("Bootstrap concluído (ou já existente).", flush=True)
+        print("Bootstrap concluído (ou já existia).", flush=True)
     except Exception as e:
         print("bootstrap error:", e, flush=True)
 
-# Em Flask 3.x, use before_serving (uma vez por worker)
-@app.before_serving
-def _run_bootstrap_once():
-    _bootstrap_if_empty()
-
+@app.before_request
+def _ensure_bootstrap_once():
+    global _bootstrapped
+    if not _bootstrapped:
+        _bootstrap_if_empty()
+        _bootstrapped = True
 
 @app.get("/health")
 def health():
