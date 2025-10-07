@@ -1,8 +1,9 @@
 # IMPORTS ABSOLUTOS (melhor para a aplicação rodando como WSGI)
 from flask import Flask, request, jsonify, render_template_string, render_template
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, timedelta 
 from pathlib import Path
+import os
 
 from src.db import ping_db
 from src.data.collectors.sgs_client import fetch_sgs_series
@@ -21,6 +22,29 @@ from src.ml.etl import load_series
 
 app = Flask(__name__)
  
+_BOOTSTRAP_FLAG = "_BOOTSTRAP_DONE"
+
+def _bootstrap_if_empty():
+    if os.environ.get(_BOOTSTRAP_FLAG) == "1":
+        return
+    try:
+        df = load_series("1")  # lê do seu warehouse/feature_store
+        if df is None or df.empty:
+            end = (date.today() - timedelta(days=1)).isoformat()
+            rows = fetch_sgs_series("1", "2010-01-01", end)
+            upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
+            insert_observations("1", rows)
+            # se seu /v1/history depende de feature_store, gere aqui também
+            # (opcional) ex.: build_features_para_code("1")
+        os.environ[_BOOTSTRAP_FLAG] = "1"
+        print("Bootstrap concluído (ou já existente).", flush=True)
+    except Exception as e:
+        print("bootstrap error:", e, flush=True)
+
+# Em Flask 3.x, use before_serving (uma vez por worker)
+@app.before_serving
+def _run_bootstrap_once():
+    _bootstrap_if_empty()
 
 
 @app.get("/health")
@@ -32,6 +56,7 @@ def health_db():
     ok = ping_db()
     code = 200 if ok else 500
     return jsonify({"db_ok": ok}), code
+
 
 # ------------------------------
 # NOVA ROTA: /v1/collect/sgs
@@ -72,6 +97,28 @@ def collect_sgs():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+    
+
+@app.post("/v1/dev/seed")
+def dev_seed():
+    try:
+        payload = request.get_json(silent=True) or {}
+        codes = payload.get("codes") or ["1"]
+        start = payload.get("start") or "2010-01-01"
+        from datetime import date, timedelta
+        end = payload.get("end") or (date.today() - timedelta(days=1)).isoformat()
+
+        summary = []
+        for code in codes:
+            upsert_series(str(code), source="SGS", name="USD/BRL PTAX venda", frequency="daily")
+            rows = fetch_sgs_series(str(code), start, end)
+            n = insert_observations(str(code), rows)
+            summary.append({"code": str(code), "db_upserts": n})
+        return jsonify({"ok": True, "summary": summary})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
     
 
 # exemplo bem direto; adapte para sua função real de build
@@ -261,9 +308,6 @@ def dashboard():
 
 @app.get("/v1/history")
 def history():
-    """
-    Retorna histórico da série: /v1/history?code=1&freq=B
-    """
     try:
         code = str(request.args.get("code", "")).strip()
         freq = str(request.args.get("freq", "B"))
@@ -271,13 +315,23 @@ def history():
             return jsonify({"error": "informe 'code'"}), 400
 
         df = load_series(code)
-        if df.empty:
-            return jsonify([])
+        if df is not None and not df.empty:
+            s = df.set_index("ts")["value"].asfreq(freq, method="ffill").dropna()
+            out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
+            return jsonify(out)
 
-        # resample para B e ffill (para casar com o modelo/dashboard)
-        s = (df.set_index("ts")["value"].asfreq(freq, method="ffill").dropna())
-        out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
-        return jsonify(out)
+        # FALLBACK: se não tem dados no warehouse, use a série do último modelo salvo
+        model, _ = load_latest_model(code, freq)
+        if model is not None:
+            import pandas as pd
+            y = pd.Series(model.data.endog, index=pd.to_datetime(model.data.row_labels), name="value")
+            s = y.asfreq(freq, method="ffill").dropna()
+            out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
+            return jsonify(out)
+
+        # se não tiver nada mesmo:
+        return jsonify([])
+
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
