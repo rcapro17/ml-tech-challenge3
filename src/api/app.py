@@ -1,21 +1,17 @@
-from flask import Flask, jsonify, request, render_template, render_template_string, abort
-import pandas as pd
-
-# IMPORTS RELATIVOS (preferível em app dentro de pacote)
-from ..db import ping_db
-from ..data.collectors.sgs_client import fetch_sgs_series
-from ..data.warehouse import upsert_series, insert_observations
-from ..data.lake import write_sgs_parquet
-from ..ml.train import train_and_backtest, forecast_next
-from ..ml.registry import (
+# IMPORTS ABSOLUTOS (melhor para a aplicação rodando como WSGI)
+from src.db import ping_db
+from src.data.collectors.sgs_client import fetch_sgs_series
+from src.data.warehouse import upsert_series, insert_observations
+from src.data.lake import write_sgs_parquet
+from src.ml.train import train_and_backtest, forecast_next
+from src.ml.registry import (
     load_latest_model,
     make_run_dir,
     save_artifacts,
     latest_run_dir as latest_model_run,
 )
-from ..ml.tuning import tune_sarimax_for_code
-from ..ml.etl import load_series
-
+from src.ml.tuning import tune_sarimax_for_code
+from src.ml.etl import load_series
 
 
 app = Flask(__name__)
