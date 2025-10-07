@@ -1,5 +1,5 @@
 # IMPORTS ABSOLUTOS (melhor para a aplicação rodando como WSGI)
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, render_template
 import pandas as pd
 
 from src.db import ping_db
