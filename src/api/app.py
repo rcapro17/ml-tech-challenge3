@@ -1,4 +1,7 @@
 # IMPORTS ABSOLUTOS (melhor para a aplicação rodando como WSGI)
+from flask import Flask, request, jsonify, render_template_string
+import pandas as pd
+
 from src.db import ping_db
 from src.data.collectors.sgs_client import fetch_sgs_series
 from src.data.warehouse import upsert_series, insert_observations
