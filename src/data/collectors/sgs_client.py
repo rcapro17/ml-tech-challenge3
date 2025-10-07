@@ -1,6 +1,8 @@
 import httpx
 from datetime import datetime
 
+
+
 BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
 
 def _fmt(d):  # recebe 'YYYY-MM-DD' e vira 'DD/MM/YYYY'

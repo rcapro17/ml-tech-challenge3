@@ -1,8 +1,9 @@
 CREATE TABLE IF NOT EXISTS series (
-  code        VARCHAR(20) PRIMARY KEY,
-  source      VARCHAR(50) NOT NULL,
-  name        VARCHAR(200),
-  frequency   VARCHAR(20)
+  code      VARCHAR(20) PRIMARY KEY,
+  source    VARCHAR(50) NOT NULL,
+  name      VARCHAR(200),
+  frequency VARCHAR(20),
+  updated_at TIMESTAMP DEFAULT NOW() 
 );
 
 CREATE TABLE IF NOT EXISTS observations (
