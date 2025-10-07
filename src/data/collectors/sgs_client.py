@@ -1,53 +1,35 @@
-"""
-SGS (Sistema Gerenciador de Séries Temporais) Client
-Fetches time series data from Banco Central do Brasil
-"""
-import requests
+import httpx
 from datetime import datetime
-from typing import List, Dict, Any
 
+BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
 
-def fetch_sgs_series(code: str, start: str, end: str) -> List[Dict[str, Any]]:
-    """
-    Fetch time series data from BCB SGS API
-    
-    Args:
-        code: Series code (e.g., "1" for SELIC)
-        start: Start date in YYYY-MM-DD format
-        end: End date in YYYY-MM-DD format
-    
-    Returns:
-        List of dictionaries with 'date' and 'value' keys
-    """
-    # Convert dates to DD/MM/YYYY format expected by BCB API
-    start_date = datetime.strptime(start, "%Y-%m-%d").strftime("%d/%m/%Y")
-    end_date = datetime.strptime(end, "%Y-%m-%d").strftime("%d/%m/%Y")
-    
-    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
+def _fmt(d):  # recebe 'YYYY-MM-DD' e vira 'DD/MM/YYYY'
+    return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+def fetch_sgs_series(code: str, start: str, end: str):
+    url = BASE.format(code=code)
     params = {
         "formato": "json",
-        "dataInicial": start_date,
-        "dataFinal": end_date
+        "dataInicial": _fmt(start),
+        "dataFinal": _fmt(end),
     }
-    
     try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Transform to expected format
-        result = []
-        for item in data:
-            result.append({
-                "date": datetime.strptime(item["data"], "%d/%m/%Y").strftime("%Y-%m-%d"),
-                "value": float(item["valor"])
-            })
-        
-        return result
-    
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching SGS series {code}: {e}")
+        r = httpx.get(url, params=params, timeout=30)
+        if r.status_code == 404:
+            # Sem dados no período: não falha o pipeline
+            return []
+        r.raise_for_status()
+        js = r.json()
+    except Exception as e:
+        # Logue e propague como lista vazia para não quebrar o fluxo de coleta
+        print(f"SGS fetch error for {code}: {e}")
         return []
-    except (KeyError, ValueError) as e:
-        print(f"Error parsing SGS response for series {code}: {e}")
-        return []
+
+    rows = []
+    for item in js:
+        # API do BCB retorna {"data": "DD/MM/YYYY", "valor": "123,45"}
+        ds = datetime.strptime(item["data"], "%d/%m/%Y").strftime("%Y-%m-%d")
+        val = float(str(item["valor"]).replace(",", "."))
+        rows.append({"ts": ds, "value": val})
+    return rows
+
