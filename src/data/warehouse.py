@@ -5,7 +5,7 @@ Handles database operations for series metadata and observations
 from typing import List, Dict, Any
 from src.db import get_engine
 from sqlalchemy import text
-from db import get_engine 
+from ..db import get_engine 
 
 
 def upsert_series(code: str, source: str, name: str, frequency: str) -> bool:
