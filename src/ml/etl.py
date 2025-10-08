@@ -2,26 +2,32 @@ import pandas as pd
 from sqlalchemy import text
 from src.db import get_engine
 
+
+from typing import Optional
+import pandas as pd
+from sqlalchemy import text
+from src.db import get_engine
+
 def load_series(code: str) -> pd.DataFrame:
     """
-    Lê a série 'code' da tabela observations e retorna DataFrame com colunas:
-    ts (datetime64[ns, UTC-naive]) e value (float).
+    Lê a série do warehouse com o schema novo:
+    observations(code VARCHAR, ts DATE, value NUMERIC)
+    Retorna DataFrame com colunas ['ts','value'].
     """
-    eng = get_engine()
-    query = text("""
-        SELECT ts, value
-        FROM observations
-        WHERE series_code = :code
-        ORDER BY ts
-    """)
-    with eng.connect() as conn:
-        df = pd.read_sql(query, conn, params={"code": code})
-
-    if df.empty:
-        return df
-
-    df["ts"] = pd.to_datetime(df["ts"])
-    df = df.dropna(subset=["value"]).sort_values("ts").reset_index(drop=True)
+    engine = get_engine()
+    with engine.connect() as conn:
+        df = pd.read_sql(
+            text("""
+                SELECT ts, value
+                FROM observations
+                WHERE code = :code
+                ORDER BY ts
+            """),
+            conn,
+            params={"code": str(code)},
+        )
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"])
     return df
 
 def make_supervised(df: pd.DataFrame, freq: str = "B", lags: int = 7) -> pd.DataFrame:
