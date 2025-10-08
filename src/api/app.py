@@ -101,6 +101,36 @@ def collect_sgs():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+    
+
+def ensure_features(code: str) -> int:
+    """
+    Gera features em data/feature_store/source=SGS/{code}.parquet
+    a partir do lake (data/raw) ou do warehouse (load_series),
+    se ainda não existirem.
+    Retorna número de linhas escritas (ou 0 se nada feito).
+    """
+    fs_path = Path(f"data/feature_store/source=SGS/{code}.parquet")
+    if fs_path.exists():
+        return 0
+
+    # tenta lake parquet primeiro
+    lake_path = Path(f"data/raw/source=SGS/{code}.parquet")
+    if lake_path.exists():
+        df = pd.read_parquet(lake_path)
+    else:
+        df = load_series(code)  # lê do banco
+
+    if df is None or df.empty:
+        return 0
+
+    s = (df.set_index("ts")["value"]
+           .asfreq("B", method="ffill")
+           .dropna()
+           .rename("value"))
+    fs_path.parent.mkdir(parents=True, exist_ok=True)
+    s.to_frame().reset_index().to_parquet(fs_path, index=False)
+    return int(s.size)
 
 # seed rápido para dev (opcional)
 @app.post("/v1/dev/seed")
@@ -221,6 +251,14 @@ def tune_train():
         freq = str(payload.get("freq", "B")).strip()
         h = int(payload.get("horizon", 5))
         init_ratio = float(payload.get("init_ratio", 0.7))
+        
+        written = ensure_features(code)
+        if written == 0:
+            # ainda pode haver features antigas; se nem arquivo existir, aborta
+            fs_path = Path(f"data/feature_store/source=SGS/{code}.parquet")
+            if not fs_path.exists():
+                return jsonify({"ok": False, "error": f"sem dados para série {code}"}), 400
+
 
         out = tune_sarimax_for_code(code=code, freq=freq, horizon=h, initial_train_ratio=init_ratio)
         if not out.get("ok"):
