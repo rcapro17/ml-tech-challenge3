@@ -1,4 +1,4 @@
-CREATE TABLE series (
+CREATE TABLE IF NOT EXISTS series (
   code       VARCHAR(50) PRIMARY KEY,
   source     VARCHAR(50),
   name       VARCHAR(255),
@@ -6,7 +6,7 @@ CREATE TABLE series (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE observations (
+CREATE TABLE IF NOT EXISTS observations (
   code  VARCHAR(50) NOT NULL,
   ts    DATE        NOT NULL,
   value NUMERIC     NOT NULL,
