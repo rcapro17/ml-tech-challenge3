@@ -1,7 +1,6 @@
 {% extends "base.html" %} {% block head %}
 <meta name="htmx-config" content='{"useTemplateFragments": true}' />
 <style>
-  /* Spinner circular */
   .spin {
     animation: spin 1s linear infinite;
   }
@@ -13,7 +12,6 @@
 </style>
 {% endblock %} {% block content %}
 <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
-  <!-- Coluna principal -->
   <div class="md:col-span-3 card">
     <div class="card-header">Histórico & Previsão</div>
     <div class="card-body">
@@ -21,9 +19,28 @@
         <label class="text-sm text-gray-600">Série (SGS code):</label>
         <input
           id="series-code"
+          name="code"
           class="px-3 py-2 rounded-lg border border-gray-300 text-sm"
           type="text"
           value="{{ default_code }}" />
+
+        <label class="text-sm text-gray-600 ml-2">Período:</label>
+        <input
+          id="from-date"
+          class="px-2 py-2 rounded-lg border border-gray-300 text-sm"
+          type="date" />
+        <span class="text-gray-500 text-sm">→</span>
+        <input
+          id="to-date"
+          class="px-2 py-2 rounded-lg border border-gray-300 text-sm"
+          type="date" />
+
+        <button
+          id="btn-apply-range"
+          type="button"
+          class="px-3 py-2 rounded-xl bg-gray-200 text-gray-800 text-sm hover:bg-gray-300">
+          Aplicar
+        </button>
 
         <button
           id="btn-refresh"
@@ -40,7 +57,6 @@
           Rodar Tuning Agora
         </button>
 
-        <!-- Indicador com spinner (controlado via JS) -->
         <span
           id="tune-indicator"
           class="inline-flex items-center gap-2 text-sm text-gray-600"
@@ -64,19 +80,16 @@
           <span>Processando…</span>
         </span>
 
-        <!-- Mensagem de sucesso/erro do tuning (HTML vindo do backend) -->
         <div id="tune-result" class="text-sm text-gray-700"></div>
       </div>
 
-      <!-- Gráfico -->
-      <div id="chart" class="w-full" style="height: 460px"></div>
+      <div id="chart" class="w-full" style="height: 500px"></div>
       <div class="text-xs text-gray-500 mt-2">
         Histórico (azul) e previsão do último modelo salvo (laranja tracejada).
       </div>
     </div>
   </div>
 
-  <!-- Coluna lateral -->
   <div class="md:col-span-1 space-y-6">
     <div class="card">
       <div class="card-header">Métricas (último modelo)</div>
@@ -117,79 +130,114 @@
 </div>
 {% endblock %} {% block scripts %}
 <script>
-  // Utilitário json
   async function fetchJSON(url, options) {
     const r = await fetch(url, options || {});
     if (!r.ok) throw new Error(await r.text());
     return await r.json();
   }
 
+  function fmtNumber(n, digits = 2) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    return Number(n).toFixed(digits);
+  }
+
+  function buildHistoryURL(code) {
+    const from = document.getElementById("from-date").value;
+    const to = document.getElementById("to-date").value;
+    const qs = new URLSearchParams({ code, freq: "B" });
+    if (from) qs.set("from", from);
+    if (to) qs.set("to", to);
+    return `/v1/history?${qs.toString()}`;
+  }
+
   async function loadDashboard(code) {
-    // Histórico
-    const hist = await fetchJSON(
-      `/v1/history?code=${encodeURIComponent(code)}&freq=B`
-    );
-    // Forecast (último modelo salvo)
+    const hist = await fetchJSON(buildHistoryURL(code));
     const fc = await fetchJSON(
       `/v1/forecast_latest?code=${encodeURIComponent(code)}&h=15&freq=B`
     );
-    // Info do último modelo
     const info = await fetchJSON(
       `/v1/last_model_info?code=${encodeURIComponent(code)}&freq=B`
     );
 
-    // Plotly — histórico
     const histTrace = {
       x: hist.map((d) => d.ts),
       y: hist.map((d) => d.value),
       mode: "lines",
       name: "Histórico",
       line: { width: 2 },
+      hovertemplate: "%{x}<br>R$ %{y:.2f}<extra></extra>",
     };
 
-    // Plotly — previsão
     const fcTrace = {
       x: fc.map((d) => d.ts),
       y: fc.map((d) => d.yhat),
       mode: "lines",
       name: "Previsão",
       line: { width: 2, dash: "dash" },
+      hovertemplate: "%{x}<br>R$ %{y:.2f}<extra></extra>",
     };
 
-    Plotly.newPlot(
-      "chart",
-      [histTrace, fcTrace],
-      {
-        margin: { t: 30, r: 10, b: 40, l: 50 },
-        legend: { orientation: "h" },
-        xaxis: { title: "Data" },
-        yaxis: { title: "Valor" },
-        paper_bgcolor: "rgba(0,0,0,0)",
-        plot_bgcolor: "rgba(0,0,0,0)",
+    const layout = {
+      margin: { t: 24, r: 12, b: 40, l: 56 },
+      legend: { orientation: "h" },
+      xaxis: {
+        title: "Data",
+        type: "date",
+        rangeslider: { visible: true, thickness: 0.12 },
+        rangeselector: {
+          buttons: [
+            { count: 7, step: "day", stepmode: "backward", label: "1w" },
+            { count: 1, step: "month", stepmode: "backward", label: "1m" },
+            { count: 6, step: "month", stepmode: "backward", label: "6m" },
+            { count: 1, step: "year", stepmode: "backward", label: "1y" },
+            { step: "year to date", label: "YTD" },
+            { step: "all", label: "All" },
+          ],
+        },
       },
-      { responsive: true }
-    );
+      yaxis: {
+        title: "Valor",
+        tickformat: ".2f",
+        hoverformat: ".2f",
+      },
+      dragmode: "pan",
+      paper_bgcolor: "rgba(0,0,0,0)",
+      plot_bgcolor: "rgba(0,0,0,0)",
+    };
 
-    // Atualiza cards
+    const config = {
+      responsive: true,
+      displaylogo: false,
+      modeBarButtonsToRemove: ["select2d", "lasso2d"],
+    };
+
+    Plotly.newPlot("chart", [histTrace, fcTrace], layout, config).then(() => {
+      // Foca no último 1 ano, se houver dados suficientes
+      if (hist.length > 0) {
+        const lastDate = new Date(hist[hist.length - 1].ts);
+        const oneYearAgo = new Date(lastDate);
+        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+        Plotly.relayout("chart", { "xaxis.range": [oneYearAgo, lastDate] });
+      }
+    });
+
     const m = info.metrics || {};
-    document.getElementById("m-mae").textContent = (m.MAE ?? "—").toFixed
-      ? m.MAE.toFixed(4)
-      : m.MAE;
-    document.getElementById("m-rmse").textContent = (m.RMSE ?? "—").toFixed
-      ? m.RMSE.toFixed(4)
-      : m.RMSE;
-    document.getElementById("m-mape").textContent = (m.MAPE ?? "—").toFixed
-      ? m.MAPE.toFixed(2) + "%"
-      : m.MAPE;
+    document.getElementById("m-mae").textContent = fmtNumber(m.MAE, 4);
+    document.getElementById("m-rmse").textContent = fmtNumber(m.RMSE, 4);
+    document.getElementById("m-mape").textContent =
+      m.MAPE != null ? fmtNumber(m.MAPE, 2) + "%" : "—";
     document.getElementById("m-n").textContent = m.n_fold_points ?? "—";
-
-    document.getElementById("m-order").textContent = info.order ?? "—";
-    document.getElementById("m-seasonal").textContent =
-      info.seasonal_order ?? "—";
+    document.getElementById("m-order").textContent = Array.isArray(info.order)
+      ? `(${info.order.join(", ")})`
+      : info.order ?? "—";
+    document.getElementById("m-seasonal").textContent = Array.isArray(
+      info.seasonal_order
+    )
+      ? `(${info.seasonal_order.join(", ")})`
+      : info.seasonal_order ?? "—";
     document.getElementById("m-run").textContent = info.run ?? "—";
   }
 
-  // Exposta globalmente pro onclick do botão
   window.runTune = async function runTune() {
     const code = document.getElementById("series-code").value.trim();
     const indicator = document.getElementById("tune-indicator");
@@ -198,7 +246,7 @@
     const btnRef = document.getElementById("btn-refresh");
 
     result.textContent = "";
-    indicator.style.display = "inline-flex"; // mostra spinner
+    indicator.style.display = "inline-flex";
     btnTune.disabled = true;
     btnTune.classList.add("opacity-60", "cursor-not-allowed");
 
@@ -206,16 +254,16 @@
       const body = new URLSearchParams({
         code,
         freq: "B",
-        horizon: 5,
+        horizon: 15,
         init_ratio: 0.7,
+        fast: "true",
       });
-
       const resp = await fetch("/v1/tune_train", {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "text/html", // força resposta HTML
-          "HX-Request": "true", // também ativa o bloco de HTML no backend
+          Accept: "text/html",
+          "HX-Request": "true",
         },
         body,
       });
@@ -230,39 +278,27 @@
           )}</pre>
         </div>`;
       } else {
-        result.innerHTML = text; // HTML “✓ Tuning concluído…”
-        // Toast curtinho
+        result.innerHTML = text; // HTML "✓ Tuning concluído"
         const toast = document.createElement("div");
         toast.className =
           "fixed bottom-4 right-4 px-4 py-3 pr-10 rounded-lg bg-emerald-600 text-white shadow-lg";
         toast.innerHTML = `
-  <span>Modelo atualizado com sucesso!</span>
-  <button type="button"
-          aria-label="Fechar"
-          class="absolute top-1 right-2 text-white/80 hover:text-white text-xl leading-none"
-          onclick="this.parentElement.remove()">
-    &times;
-  </button>
-`;
+          <span>Modelo atualizado com sucesso!</span>
+          <button type="button" aria-label="Fechar" class="absolute top-1 right-2 text-white/80 hover:text-white text-xl leading-none" onclick="this.parentElement.remove()">&times;</button>`;
         document.body.appendChild(toast);
         setTimeout(() => toast?.remove(), 4000);
-
-        // redesenha gráfico/cards
-        btnRef.click();
+        btnRef.click(); // redesenha
       }
     } catch (err) {
       console.error("[runTune] error", err);
-      result.innerHTML = `<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-red-700">
-        Erro inesperado ao rodar tuning.
-      </div>`;
+      result.innerHTML = `<div class="p-3 rounded-lg bg-red-50 border border-red-200 text-red-700">Erro inesperado ao rodar tuning.</div>`;
     } finally {
-      indicator.style.display = "none"; // esconde spinner
+      indicator.style.display = "none";
       btnTune.disabled = false;
       btnTune.classList.remove("opacity-60", "cursor-not-allowed");
     }
   };
 
-  // Atualizar → redesenha tudo
   document.getElementById("btn-refresh").addEventListener("click", () => {
     const code = document.getElementById("series-code").value.trim();
     loadDashboard(code).catch((err) =>
@@ -270,7 +306,13 @@
     );
   });
 
-  // Carrega ao abrir a página
+  document.getElementById("btn-apply-range").addEventListener("click", () => {
+    const code = document.getElementById("series-code").value.trim();
+    loadDashboard(code).catch((err) =>
+      console.error("[applyRange] error", err)
+    );
+  });
+
   window.addEventListener("load", () => {
     const code = document.getElementById("series-code").value.trim();
     loadDashboard(code).catch((err) =>

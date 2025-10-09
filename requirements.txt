@@ -18,3 +18,7 @@ scikit-learn==1.5.1
 
 # opcional
 python-dateutil==2.9.0.post0
+
+s3fs>=2024.6.0
+pyarrow>=15
+

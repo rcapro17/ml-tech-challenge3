@@ -21,18 +21,15 @@ from src.ml.registry import (
 from src.ml.tuning import tune_sarimax_for_code
 from src.ml.etl import load_series
 
-# se você montou um Disk no Render em /opt/render/project/src/data,
-# usar caminhos relativos "data/..." já aponta para lá.
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 
 app = Flask(__name__)
 
-# -------- bootstrap idempotente (1x por worker) --------
 _BOOTSTRAP_ENV = "_BOOTSTRAP_DONE"
 _bootstrapped = False
 
+
 def _bootstrap_if_empty() -> None:
-    """Se a série '1' não existir no warehouse, cria + coleta histórico."""
     if os.environ.get(_BOOTSTRAP_ENV) == "1":
         return
     try:
@@ -42,7 +39,6 @@ def _bootstrap_if_empty() -> None:
             rows = fetch_sgs_series("1", "2010-01-01", end)
             upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
             n = insert_observations("1", rows)
-            # opcional: lake parquet
             try:
                 write_sgs_parquet("1", rows, base_dir=str(DATA_DIR / "raw"))
             except Exception as e:
@@ -54,6 +50,7 @@ def _bootstrap_if_empty() -> None:
     except Exception as e:
         print("[bootstrap] erro:", e, flush=True)
 
+
 @app.before_request
 def _run_bootstrap_once():
     global _bootstrapped
@@ -61,17 +58,18 @@ def _run_bootstrap_once():
         _bootstrap_if_empty()
         _bootstrapped = True
 
-# -------- health --------
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "ml-tech-challenge", "framework": "flask"})
+
 
 @app.get("/health/db")
 def health_db():
     ok = ping_db()
     return jsonify({"db_ok": ok}), (200 if ok else 500)
 
-# -------- coleta --------
+
 @app.post("/v1/collect/sgs")
 def collect_sgs():
     try:
@@ -90,33 +88,33 @@ def collect_sgs():
             code = str(c)
             meta = metadata.get(code, {})
             upsert_series(
-                code, source="SGS",
+                code,
+                source="SGS",
                 name=meta.get("name", f"SGS {code}"),
                 frequency=meta.get("frequency", "daily"),
             )
-            rows = fetch_sgs_series(code, start, end)
-            n_db = insert_observations(code, rows)
 
-            n_lake = 0
-            if write_lake:
-                try:
-                    n_lake = write_sgs_parquet(code, rows, base_dir=str(DATA_DIR / "raw"))
-                except Exception as e:
-                    print(f"Error writing parquet for series {code}: {e}", flush=True)
-
-            summary.append({"code": code, "db_upserts": n_db, "lake_rows": n_lake})
+            try:
+                rows = fetch_sgs_series(code, start, end)
+                n_db = insert_observations(code, rows)
+                n_lake = 0
+                if write_lake:
+                    try:
+                        n_lake = write_sgs_parquet(code, rows, base_dir=str(DATA_DIR / "raw"))
+                    except Exception as e:
+                        print(f"Error writing parquet for series {code}: {e}", flush=True)
+                summary.append({"code": code, "db_upserts": n_db, "lake_rows": n_lake})
+            except Exception as e:
+                # não derruba a requisição inteira — reporta erro no summary
+                summary.append({"code": code, "db_upserts": 0, "lake_rows": 0, "error": str(e)})
 
         return jsonify({"ok": True, "summary": summary})
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -------- feature store auxiliar --------
+
 def ensure_features(code: str) -> int:
-    """
-    Gera features B-day a partir do lake/warehouse se ainda não existir
-    data/feature_store/source=SGS/{code}.parquet. Retorna linhas escritas.
-    """
     fs_path = DATA_DIR / "feature_store" / "source=SGS" / f"{code}.parquet"
     if fs_path.exists():
         return 0
@@ -130,15 +128,17 @@ def ensure_features(code: str) -> int:
     if df is None or df.empty:
         return 0
 
-    s = (df.set_index("ts")["value"]
-           .asfreq("B", method="ffill")
-           .dropna()
-           .rename("value"))
+    s = (
+        df.set_index("ts")["value"]
+        .asfreq("B", method="ffill")
+        .dropna()
+        .rename("value")
+    )
     fs_path.parent.mkdir(parents=True, exist_ok=True)
     s.to_frame().reset_index().to_parquet(fs_path, index=False)
     return int(s.size)
 
-# (opcional) seed de desenvolvimento
+
 @app.post("/v1/dev/seed")
 def dev_seed():
     try:
@@ -162,6 +162,7 @@ def dev_seed():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.post("/v1/build_features")
 def build_features_endpoint():
     try:
@@ -179,7 +180,7 @@ def build_features_endpoint():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -------- previsão (treino rápido online) --------
+
 @app.post("/v1/predict")
 def predict():
     try:
@@ -212,7 +213,7 @@ def predict():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -------- previsão com último modelo salvo --------
+
 @app.post("/v1/predict_latest")
 def predict_latest():
     try:
@@ -237,7 +238,7 @@ def predict_latest():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -------- tuning + salvar artefatos --------
+
 @app.post("/v1/tune_train")
 def tune_train():
     try:
@@ -246,24 +247,20 @@ def tune_train():
         freq = str(payload.get("freq", "B")).strip()
         h = int(payload.get("horizon", 5))
         init_ratio = float(payload.get("init_ratio", 0.7))
-        # tolera 'fast' vindo do botão (se o tuning.py não usar, tudo bem)
-        fast = str(payload.get("fast", "false")).lower() in ("1", "true", "yes")
+        fast = str(payload.get("fast", "true")).lower() in ("1", "true", "yes")
 
-        # garante features (se ainda não existirem)
         written = ensure_features(code)
         fs_path = DATA_DIR / "feature_store" / "source=SGS" / f"{code}.parquet"
         if written == 0 and not fs_path.exists():
             return jsonify({"ok": False, "error": f"sem dados para série {code}"}), 400
 
-        # chama o tuner (aceita ou ignora 'fast', conforme versão)
-        try:
-            out = tune_sarimax_for_code(code=code, freq=freq, horizon=h,
-                                        initial_train_ratio=init_ratio, fast=fast)  # ok se a função aceitar
-        except TypeError:
-            # versão antiga sem 'fast'
-            out = tune_sarimax_for_code(code=code, freq=freq, horizon=h,
-                                        initial_train_ratio=init_ratio)
-
+        out = tune_sarimax_for_code(
+            code=code,
+            freq=freq,
+            horizon=h,
+            initial_train_ratio=init_ratio,
+            fast=fast,
+        )
         if not out.get("ok"):
             return jsonify(out), 400
 
@@ -284,7 +281,6 @@ def tune_train():
             }
         )
 
-        # Se pediu HTML (HTMX/Accept), devolve flash HTML
         accepts_html = "text/html" in (request.headers.get("Accept", "") or "")
         if request.headers.get("HX-Request") == "true" or accepts_html:
             return render_template_string(
@@ -310,7 +306,6 @@ def tune_train():
                 run=run_dir
             )
 
-        # Caso contrário, JSON
         return jsonify({
             "ok": True,
             "best": {"order": best["order"], "seasonal_order": best["seasonal_order"], "metrics": best["metrics"]},
@@ -321,43 +316,57 @@ def tune_train():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -------- dashboard --------
+
 @app.get("/dashboard")
 def dashboard():
-    return render_template("dashboard.html",
-                           title="Dashboard",
-                           subtitle="SGS → Lake → Feature Store → Modelo",
-                           default_code="1")
+    return render_template(
+        "dashboard.html",
+        title="Dashboard",
+        subtitle="SGS → Lake → Feature Store → Modelo",
+        default_code="1",
+    )
 
-# -------- APIs de leitura --------
+
 @app.get("/v1/history")
 def history():
     try:
         code = str(request.args.get("code", "")).strip()
         freq = str(request.args.get("freq", "B"))
+        from_s = request.args.get("from")
+        to_s = request.args.get("to")
+
         if not code:
             return jsonify({"error": "informe 'code'"}), 400
 
         df = load_series(code)
-        if df is not None and not df.empty:
-            s = df.set_index("ts")["value"].asfreq(freq, method="ffill").dropna()
-            out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
-            return jsonify(out)
+        if df is None or df.empty:
+            # fallback: se existir modelo salvo, plota o histórico do modelo
+            model, _ = load_latest_model(code, freq)
+            if model is not None:
+                y = pd.Series(
+                    model.data.endog,
+                    index=pd.to_datetime(model.data.row_labels),
+                    name="value",
+                )
+                s = y.asfreq(freq, method="ffill").dropna()
+                out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
+                return jsonify(out)
+            return jsonify([])
 
-        model, _ = load_latest_model(code, freq)
-        if model is not None:
-            y = pd.Series(model.data.endog,
-                          index=pd.to_datetime(model.data.row_labels),
-                          name="value")
-            s = y.asfreq(freq, method="ffill").dropna()
-            out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
-            return jsonify(out)
+        # aplica filtro de datas se informado
+        if from_s:
+            df = df[df["ts"] >= pd.to_datetime(from_s)]
+        if to_s:
+            df = df[df["ts"] <= pd.to_datetime(to_s)]
 
-        return jsonify([])
+        s = df.set_index("ts")["value"].asfreq(freq, method="ffill").dropna()
+        out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
+        return jsonify(out)
 
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.get("/v1/forecast_latest")
 def forecast_latest():
@@ -373,13 +382,14 @@ def forecast_latest():
             return jsonify([])
 
         last_ts = pd.to_datetime(model.data.row_labels[-1])
-        idx = pd.bdate_range(start=last_ts, periods=h+1, inclusive="neither")
+        idx = pd.bdate_range(start=last_ts, periods=h + 1, inclusive="neither")
         yhat = model.forecast(steps=h)
         out = [{"ts": ts.strftime("%Y-%m-%d"), "yhat": float(val)} for ts, val in zip(idx, yhat)]
         return jsonify(out)
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.get("/v1/last_model_info")
 def last_model_info():
@@ -401,6 +411,6 @@ def last_model_info():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 if __name__ == "__main__":
-    # dev local
     app.run(host="0.0.0.0", port=8000, debug=False)

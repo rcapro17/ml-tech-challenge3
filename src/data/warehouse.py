@@ -1,30 +1,35 @@
-# src/data/warehouse.py
 from typing import List, Dict, Any
 from sqlalchemy import text
-from src.db import get_engine   # ✅ use só este import (absoluto)
+from src.db import get_engine  # import absoluto
 
 def upsert_series(code: str, source: str, name: str, frequency: str) -> bool:
+    """
+    Upsert na tabela series.
+    """
     try:
         engine = get_engine()
         with engine.connect() as conn:
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS series (
-                    code VARCHAR(50) PRIMARY KEY,
-                    source VARCHAR(50),
-                    name VARCHAR(255),
-                    frequency VARCHAR(50),
+                    code       VARCHAR(50) PRIMARY KEY,
+                    source     VARCHAR(50),
+                    name       VARCHAR(255),
+                    frequency  VARCHAR(50),
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
-            conn.execute(text("""
-                INSERT INTO series (code, source, name, frequency, updated_at)
-                VALUES (:code, :source, :name, :frequency, CURRENT_TIMESTAMP)
-                ON CONFLICT (code)
-                DO UPDATE SET
-                    name = EXCLUDED.name,
-                    frequency = EXCLUDED.frequency,
-                    updated_at = CURRENT_TIMESTAMP
-            """), {"code": code, "source": source, "name": name, "frequency": frequency})
+            conn.execute(
+                text("""
+                    INSERT INTO series (code, source, name, frequency, updated_at)
+                    VALUES (:code, :source, :name, :frequency, CURRENT_TIMESTAMP)
+                    ON CONFLICT (code)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        frequency = EXCLUDED.frequency,
+                        updated_at = CURRENT_TIMESTAMP
+                """),
+                {"code": code, "source": source, "name": name, "frequency": frequency}
+            )
             conn.commit()
         return True
     except Exception as e:
@@ -34,18 +39,21 @@ def upsert_series(code: str, source: str, name: str, frequency: str) -> bool:
 
 def insert_observations(code: str, observations: List[Dict[str, Any]]) -> int:
     """
-    Aceita linhas com 'ts' ou 'date' e grava em 'ts' (DATE). PK: (code, ts)
+    Insere observações no schema padronizado:
+        observations(code VARCHAR, ts DATE, value NUMERIC, PRIMARY KEY (code, ts))
+    Aceita entradas com 'ts' ou 'date' e normaliza para 'ts'.
     """
     if not observations:
         return 0
 
-    norm = []
+    norm: list[dict] = []
     for obs in observations:
         ts = obs.get("ts") or obs.get("date")
         val = obs.get("value")
         if not ts or val is None:
             continue
         norm.append({"code": code, "ts": ts, "value": val})
+
     if not norm:
         return 0
 

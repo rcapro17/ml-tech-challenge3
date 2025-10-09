@@ -1,7 +1,4 @@
-import pandas as pd
-from sqlalchemy import text
-from src.db import get_engine
-
+from __future__ import annotations
 
 from typing import Optional
 import pandas as pd
@@ -10,9 +7,9 @@ from src.db import get_engine
 
 def load_series(code: str) -> pd.DataFrame:
     """
-    Lê a série do warehouse com o schema novo:
-    observations(code VARCHAR, ts DATE, value NUMERIC)
-    Retorna DataFrame com colunas ['ts','value'].
+    Lê a série do warehouse (schema unificado):
+        observations(code VARCHAR, ts DATE, value NUMERIC)
+    Retorna DataFrame com colunas ['ts'(datetime64), 'value'(float)].
     """
     engine = get_engine()
     with engine.connect() as conn:
@@ -28,7 +25,10 @@ def load_series(code: str) -> pd.DataFrame:
         )
     if not df.empty:
         df["ts"] = pd.to_datetime(df["ts"])
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["ts", "value"])
     return df
+
 
 def make_supervised(df: pd.DataFrame, freq: str = "B", lags: int = 7) -> pd.DataFrame:
     """
@@ -37,9 +37,7 @@ def make_supervised(df: pd.DataFrame, freq: str = "B", lags: int = 7) -> pd.Data
     """
     if df.empty:
         return df
-    s = (df.set_index("ts")["value"]
-           .resample(freq).ffill()
-           .rename("value"))
+    s = (df.set_index("ts")["value"].resample(freq).ffill().rename("value"))
     out = pd.DataFrame({"value": s})
     for k in range(1, lags + 1):
         out[f"lag{k}"] = out["value"].shift(k)
