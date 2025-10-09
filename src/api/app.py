@@ -1,16 +1,15 @@
-# src/api/app.py
 from __future__ import annotations
 
 from flask import Flask, request, jsonify, render_template_string, render_template
 import pandas as pd
 from datetime import date, timedelta
-from pathlib import Path
 import os
+from pathlib import Path
 
 from src.db import ping_db
 from src.data.collectors.sgs_client import fetch_sgs_series
 from src.data.warehouse import upsert_series, insert_observations
-from src.data.lake import write_sgs_parquet
+from src.data.lake import write_sgs_parquet, read_sgs_parquet
 from src.ml.train import train_and_backtest, forecast_next
 from src.ml.registry import (
     load_latest_model,
@@ -21,15 +20,14 @@ from src.ml.registry import (
 from src.ml.tuning import tune_sarimax_for_code
 from src.ml.etl import load_series
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
-
 app = Flask(__name__)
 
+# -------- bootstrap idempotente (1x por worker) --------
 _BOOTSTRAP_ENV = "_BOOTSTRAP_DONE"
 _bootstrapped = False
 
-
 def _bootstrap_if_empty() -> None:
+    """Se a série '1' não existir no warehouse, cria + coleta histórico."""
     if os.environ.get(_BOOTSTRAP_ENV) == "1":
         return
     try:
@@ -39,8 +37,10 @@ def _bootstrap_if_empty() -> None:
             rows = fetch_sgs_series("1", "2010-01-01", end)
             upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
             n = insert_observations("1", rows)
+            # tenta gravar no lake (S3 ou local, conforme DATA_URI)
             try:
-                write_sgs_parquet("1", rows, base_dir=str(DATA_DIR / "raw"))
+                n_lake = write_sgs_parquet("1", rows)
+                print(f"[bootstrap] lake rows written: {n_lake}", flush=True)
             except Exception as e:
                 print("bootstrap parquet warn:", e, flush=True)
             print(f"[bootstrap] Série 1 populada: {n} pontos até {end}.", flush=True)
@@ -50,7 +50,6 @@ def _bootstrap_if_empty() -> None:
     except Exception as e:
         print("[bootstrap] erro:", e, flush=True)
 
-
 @app.before_request
 def _run_bootstrap_once():
     global _bootstrapped
@@ -58,18 +57,17 @@ def _run_bootstrap_once():
         _bootstrap_if_empty()
         _bootstrapped = True
 
-
+# -------- health --------
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "ml-tech-challenge", "framework": "flask"})
-
 
 @app.get("/health/db")
 def health_db():
     ok = ping_db()
     return jsonify({"db_ok": ok}), (200 if ok else 500)
 
-
+# -------- coleta --------
 @app.post("/v1/collect/sgs")
 def collect_sgs():
     try:
@@ -78,7 +76,7 @@ def collect_sgs():
         start = payload.get("start")
         end = payload.get("end")
         metadata = payload.get("metadata") or {}
-        write_lake = bool(payload.get("write_lake", False))
+        write_lake_flag = bool(payload.get("write_lake", False))
 
         if not codes or not start or not end:
             return jsonify({"error": "Informe 'codes' (lista), 'start' e 'end' (YYYY-MM-DD)."}), 400
@@ -88,81 +86,63 @@ def collect_sgs():
             code = str(c)
             meta = metadata.get(code, {})
             upsert_series(
-                code,
-                source="SGS",
+                code, source="SGS",
                 name=meta.get("name", f"SGS {code}"),
                 frequency=meta.get("frequency", "daily"),
             )
+            rows = fetch_sgs_series(code, start, end)
+            n_db = insert_observations(code, rows)
 
-            try:
-                rows = fetch_sgs_series(code, start, end)
-                n_db = insert_observations(code, rows)
-                n_lake = 0
-                if write_lake:
-                    try:
-                        n_lake = write_sgs_parquet(code, rows, base_dir=str(DATA_DIR / "raw"))
-                    except Exception as e:
-                        print(f"Error writing parquet for series {code}: {e}", flush=True)
-                summary.append({"code": code, "db_upserts": n_db, "lake_rows": n_lake})
-            except Exception as e:
-                # não derruba a requisição inteira — reporta erro no summary
-                summary.append({"code": code, "db_upserts": 0, "lake_rows": 0, "error": str(e)})
+            n_lake = 0
+            if write_lake_flag:
+                try:
+                    n_lake = write_sgs_parquet(code, rows)  # usa DATA_URI internamente
+                except Exception as e:
+                    print(f"[collect] lake write error {code}: {e}", flush=True)
+
+            summary.append({"code": code, "db_upserts": n_db, "lake_rows": n_lake})
 
         return jsonify({"ok": True, "summary": summary})
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
+# -------- feature store auxiliar --------
 def ensure_features(code: str) -> int:
-    fs_path = DATA_DIR / "feature_store" / "source=SGS" / f"{code}.parquet"
-    if fs_path.exists():
-        return 0
-
-    lake_path = DATA_DIR / "raw" / "source=SGS" / f"{code}.parquet"
-    if lake_path.exists():
-        df = pd.read_parquet(lake_path)
-    else:
+    """
+    Gera features B-day a partir do lake (preferência) e do warehouse se parquet não existir.
+    Grava em {DATA_URI}/feature_store/source=SGS/{code}.parquet
+    """
+    # 1) tenta lake/parquet
+    df = read_sgs_parquet(code)
+    if (df is None) or df.empty:
+        # 2) fallback: warehouse
         df = load_series(code)
 
     if df is None or df.empty:
         return 0
 
-    s = (
-        df.set_index("ts")["value"]
-        .asfreq("B", method="ffill")
-        .dropna()
-        .rename("value")
-    )
-    fs_path.parent.mkdir(parents=True, exist_ok=True)
-    s.to_frame().reset_index().to_parquet(fs_path, index=False)
+    s = (df.set_index("ts")["value"]
+           .asfreq("B", method="ffill")
+           .dropna()
+           .rename("value"))
+
+    # salva no mesmo backend do lake (DATA_URI) usando lake.write? Aqui salvamos direto via s3util.
+    from src.storage.s3util import get_fs_for_uri, join_uri
+
+    data_root = (os.getenv("DATA_URI") or "data").rstrip("/")
+    fs = get_fs_for_uri(data_root)
+    out_path = join_uri(data_root, f"feature_store/source=SGS/{code}.parquet")
+
+    buf = BytesIO()
+    s.to_frame().reset_index().to_parquet(buf, index=False, engine="pyarrow")
+    buf.seek(0)
+    with fs.open(out_path, "wb") as f:
+        f.write(buf.read())
+
     return int(s.size)
 
-
-@app.post("/v1/dev/seed")
-def dev_seed():
-    try:
-        payload = request.get_json(silent=True) or {}
-        codes = [str(c) for c in (payload.get("codes") or ["1"])]
-        start = payload.get("start") or "2010-01-01"
-        end = payload.get("end") or (date.today() - timedelta(days=1)).isoformat()
-
-        summary = []
-        for code in codes:
-            upsert_series(code, source="SGS", name="USD/BRL PTAX venda", frequency="daily")
-            rows = fetch_sgs_series(code, start, end)
-            n = insert_observations(code, rows)
-            try:
-                write_sgs_parquet(code, rows, base_dir=str(DATA_DIR / "raw"))
-            except Exception:
-                pass
-            summary.append({"code": code, "db_upserts": n})
-        return jsonify({"ok": True, "summary": summary})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
+# -------- endpoints de features (mantidos) --------
 @app.post("/v1/build_features")
 def build_features_endpoint():
     try:
@@ -180,7 +160,7 @@ def build_features_endpoint():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
+# -------- previsão (treino rápido online) --------
 @app.post("/v1/predict")
 def predict():
     try:
@@ -213,7 +193,7 @@ def predict():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
+# -------- previsão com último modelo salvo --------
 @app.post("/v1/predict_latest")
 def predict_latest():
     try:
@@ -238,7 +218,7 @@ def predict_latest():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
+# -------- tuning + salvar artefatos --------
 @app.post("/v1/tune_train")
 def tune_train():
     try:
@@ -247,20 +227,23 @@ def tune_train():
         freq = str(payload.get("freq", "B")).strip()
         h = int(payload.get("horizon", 5))
         init_ratio = float(payload.get("init_ratio", 0.7))
-        fast = str(payload.get("fast", "true")).lower() in ("1", "true", "yes")
+        fast = str(payload.get("fast", "false")).lower() in ("1", "true", "yes")
 
         written = ensure_features(code)
-        fs_path = DATA_DIR / "feature_store" / "source=SGS" / f"{code}.parquet"
-        if written == 0 and not fs_path.exists():
+        from src.storage.s3util import get_fs_for_uri, join_uri
+        data_root = (os.getenv("DATA_URI") or "data").rstrip("/")
+        fs = get_fs_for_uri(data_root)
+        fs_features = join_uri(data_root, f"feature_store/source=SGS/{code}.parquet")
+        if written == 0 and not fs.exists(fs_features):
             return jsonify({"ok": False, "error": f"sem dados para série {code}"}), 400
 
-        out = tune_sarimax_for_code(
-            code=code,
-            freq=freq,
-            horizon=h,
-            initial_train_ratio=init_ratio,
-            fast=fast,
-        )
+        try:
+            out = tune_sarimax_for_code(code=code, freq=freq, horizon=h,
+                                        initial_train_ratio=init_ratio, fast=fast)
+        except TypeError:
+            out = tune_sarimax_for_code(code=code, freq=freq, horizon=h,
+                                        initial_train_ratio=init_ratio)
+
         if not out.get("ok"):
             return jsonify(out), 400
 
@@ -316,57 +299,43 @@ def tune_train():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
+# -------- dashboard --------
 @app.get("/dashboard")
 def dashboard():
-    return render_template(
-        "dashboard.html",
-        title="Dashboard",
-        subtitle="SGS → Lake → Feature Store → Modelo",
-        default_code="1",
-    )
+    return render_template("dashboard.html",
+                           title="Dashboard",
+                           subtitle="SGS → Lake (S3) → Feature Store → Modelo",
+                           default_code="1")
 
-
+# -------- APIs de leitura --------
 @app.get("/v1/history")
 def history():
     try:
         code = str(request.args.get("code", "")).strip()
         freq = str(request.args.get("freq", "B"))
-        from_s = request.args.get("from")
-        to_s = request.args.get("to")
-
         if not code:
             return jsonify({"error": "informe 'code'"}), 400
 
         df = load_series(code)
-        if df is None or df.empty:
-            # fallback: se existir modelo salvo, plota o histórico do modelo
-            model, _ = load_latest_model(code, freq)
-            if model is not None:
-                y = pd.Series(
-                    model.data.endog,
-                    index=pd.to_datetime(model.data.row_labels),
-                    name="value",
-                )
-                s = y.asfreq(freq, method="ffill").dropna()
-                out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
-                return jsonify(out)
-            return jsonify([])
+        if df is not None and not df.empty:
+            s = df.set_index("ts")["value"].asfreq(freq, method="ffill").dropna()
+            out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
+            return jsonify(out)
 
-        # aplica filtro de datas se informado
-        if from_s:
-            df = df[df["ts"] >= pd.to_datetime(from_s)]
-        if to_s:
-            df = df[df["ts"] <= pd.to_datetime(to_s)]
+        model, _ = load_latest_model(code, freq)
+        if model is not None:
+            y = pd.Series(model.data.endog,
+                          index=pd.to_datetime(model.data.row_labels),
+                          name="value")
+            s = y.asfreq(freq, method="ffill").dropna()
+            out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
+            return jsonify(out)
 
-        s = df.set_index("ts")["value"].asfreq(freq, method="ffill").dropna()
-        out = [{"ts": ts.strftime("%Y-%m-%d"), "value": float(v)} for ts, v in s.items()]
-        return jsonify(out)
+        return jsonify([])
 
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.get("/v1/forecast_latest")
 def forecast_latest():
@@ -382,14 +351,13 @@ def forecast_latest():
             return jsonify([])
 
         last_ts = pd.to_datetime(model.data.row_labels[-1])
-        idx = pd.bdate_range(start=last_ts, periods=h + 1, inclusive="neither")
+        idx = pd.bdate_range(start=last_ts, periods=h+1, inclusive="neither")
         yhat = model.forecast(steps=h)
         out = [{"ts": ts.strftime("%Y-%m-%d"), "yhat": float(val)} for ts, val in zip(idx, yhat)]
         return jsonify(out)
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.get("/v1/last_model_info")
 def last_model_info():
@@ -411,6 +379,6 @@ def last_model_info():
         import traceback; traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 if __name__ == "__main__":
+    # dev local
     app.run(host="0.0.0.0", port=8000, debug=False)

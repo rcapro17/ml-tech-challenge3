@@ -1,85 +1,104 @@
 """
-Data Lake operations for time series data
-Handles file-based storage in Parquet format (local or S3 via fsspec)
+Data Lake ops (S3 ou local) para séries temporais em Parquet.
+- Escreve/ lê usando fsspec (S3 quando DATA_URI começa com s3://).
+- Normaliza observações aceitando 'ts' ou 'date' e escreve como ['ts','value'].
 """
 from __future__ import annotations
 
+from typing import List, Dict, Any
 import os
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from io import BytesIO
+
 import pandas as pd
-import fsspec
 
 from src.storage.s3util import get_fs_for_uri, join_uri
 
-# DATA_URI define a raiz do lake (ex.: s3://bucket/prod ou data)
-DATA_URI = (os.environ.get("DATA_URI") or "data").strip().rstrip("/")
 
-def _write_parquet_df(df: pd.DataFrame, url: str) -> None:
-    fs = get_fs_for_uri(url)
-    with fs.open(url, "wb") as f:
-        df.to_parquet(f, index=False)
-
-def _read_parquet_df(url: str) -> pd.DataFrame:
-    fs = get_fs_for_uri(url)
-    if not fs.exists(url):
-        return pd.DataFrame()
-    with fs.open(url, "rb") as f:
-        return pd.read_parquet(f)
-
-def write_sgs_parquet(code: str, observations: List[Dict[str, Any]]) -> int:
+def _get_data_root() -> str:
     """
-    Escreve parquet único por série:
-    {DATA_URI}/raw/source=SGS/{code}.parquet
+    Retorna o root do lake:
+      - S3: s3://bucket/prefix (ex.: s3://ml-tech-challenge3-xxx/prod)
+      - Local fallback: 'data'
+    """
+    uri = (os.getenv("DATA_URI") or "data").rstrip("/")
+    return uri
+
+
+def _to_df(observations: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Aceita registros no formato {'ts': 'YYYY-MM-DD', 'value': float} OU {'date': ..., 'value': ...}
+    e retorna DataFrame com colunas ['ts','value'] (ts datetime64[ns]).
     """
     if not observations:
-        return 0
+        return pd.DataFrame(columns=["ts", "value"])
 
-    # normaliza chaves -> ts/value
-    rows = []
+    # normaliza chaves
+    recs = []
     for r in observations:
         ts = r.get("ts") or r.get("date")
         val = r.get("value")
-        if ts and val is not None:
-            rows.append({"ts": ts, "value": val})
-    if not rows:
+        if ts is None or val is None:
+            continue
+        recs.append({"ts": ts, "value": val})
+
+    if not recs:
+        return pd.DataFrame(columns=["ts", "value"])
+
+    df = pd.DataFrame(recs)
+    df["ts"] = pd.to_datetime(df["ts"])
+    df = df.sort_values("ts").drop_duplicates(subset=["ts"])
+    return df[["ts", "value"]]
+
+
+def write_sgs_parquet(code: str, observations: List[Dict[str, Any]]) -> int:
+    """
+    Escreve Parquet único por série:
+      {DATA_URI}/raw/source=SGS/{code}.parquet
+
+    Retorna quantidade de linhas escritas (0 se nada).
+    """
+    df = _to_df(observations)
+    if df.empty:
         return 0
 
-    df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["ts"])
-    df = df.sort_values("ts")
+    data_root = _get_data_root()
+    # caminho lógico no lake
+    out_path = join_uri(data_root, f"raw/source=SGS/{code}.parquet")
 
-    url = join_uri(DATA_URI, "raw", "source=SGS", f"{code}.parquet")
+    # usa fsspec para abrir/grav ar em qualquer backend (S3/local)
+    fs = get_fs_for_uri(data_root)
 
-    try:
-        _write_parquet_df(df, url)
-        print(f"[lake] wrote {len(df)} rows → {url}", flush=True)
-        return len(df)
-    except Exception as e:
-        # fallback para disco local em caso de falha no S3
-        print(f"[lake] WARN: write to {url} failed: {e}. Falling back to local 'data/raw'...", flush=True)
-        local_dir = Path("data/raw/source=SGS")
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_path = local_dir / f"{code}.parquet"
-        df.to_parquet(local_path, index=False)
-        return len(df)
+    # pandas aceita file-like buffer; aqui fazemos to_parquet para BytesIO e gravamos via fs.open
+    buf = BytesIO()
+    df.to_parquet(buf, index=False, engine="pyarrow")
+    buf.seek(0)
+
+    with fs.open(out_path, "wb") as f:
+        f.write(buf.read())
+
+    # confirmação leve (não levanta exceção se Listing for bloqueado, então só retorna len(df))
+    return int(len(df))
+
 
 def read_sgs_parquet(code: str) -> pd.DataFrame:
     """
-    Lê parquet {DATA_URI}/raw/source=SGS/{code}.parquet (S3 ou local).
+    Lê o Parquet do lake se existir. Caso contrário, retorna DF vazio.
+      {DATA_URI}/raw/source=SGS/{code}.parquet
     """
-    url = join_uri(DATA_URI, "raw", "source=SGS", f"{code}.parquet")
+    data_root = _get_data_root()
+    in_path = join_uri(data_root, f"raw/source=SGS/{code}.parquet")
+    fs = get_fs_for_uri(data_root)
+
     try:
-        df = _read_parquet_df(url)
-        if not df.empty:
+        if not fs.exists(in_path):
+            return pd.DataFrame(columns=["ts", "value"])
+        with fs.open(in_path, "rb") as f:
+            df = pd.read_parquet(f, engine="pyarrow")
+        # garante tipos/ordem
+        if "ts" in df.columns:
             df["ts"] = pd.to_datetime(df["ts"])
-        return df
+            df = df.sort_values("ts").drop_duplicates(subset=["ts"])
+        return df[["ts", "value"]]
     except Exception as e:
-        print(f"[lake] WARN: read from {url} failed: {e}. Trying local fallback...", flush=True)
-        # fallback local
-        p = Path("data/raw/source=SGS") / f"{code}.parquet"
-        if p.exists():
-            df = pd.read_parquet(p)
-            df["ts"] = pd.to_datetime(df["ts"])
-            return df
-        return pd.DataFrame()
+        print(f"[lake] read error for {code}: {e}", flush=True)
+        return pd.DataFrame(columns=["ts", "value"])
