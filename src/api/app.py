@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify, render_template_string, render_templa
 import pandas as pd
 from datetime import date, timedelta
 import os
+from io import BytesIO  # ✅ NECESSÁRIO para escrever Parquet via fsspec
 from pathlib import Path
 
 from src.db import ping_db
@@ -37,7 +38,7 @@ def _bootstrap_if_empty() -> None:
             rows = fetch_sgs_series("1", "2010-01-01", end)
             upsert_series("1", source="SGS", name="USD/BRL PTAX venda", frequency="daily")
             n = insert_observations("1", rows)
-            # tenta gravar no lake (S3 ou local, conforme DATA_URI)
+            # grava no lake (S3/local via DATA_URI)
             try:
                 n_lake = write_sgs_parquet("1", rows)
                 print(f"[bootstrap] lake rows written: {n_lake}", flush=True)
@@ -96,7 +97,7 @@ def collect_sgs():
             n_lake = 0
             if write_lake_flag:
                 try:
-                    n_lake = write_sgs_parquet(code, rows)  # usa DATA_URI internamente
+                    n_lake = write_sgs_parquet(code, rows)
                 except Exception as e:
                     print(f"[collect] lake write error {code}: {e}", flush=True)
 
@@ -127,9 +128,8 @@ def ensure_features(code: str) -> int:
            .dropna()
            .rename("value"))
 
-    # salva no mesmo backend do lake (DATA_URI) usando lake.write? Aqui salvamos direto via s3util.
+    # salva no mesmo backend do lake (DATA_URI)
     from src.storage.s3util import get_fs_for_uri, join_uri
-
     data_root = (os.getenv("DATA_URI") or "data").rstrip("/")
     fs = get_fs_for_uri(data_root)
     out_path = join_uri(data_root, f"feature_store/source=SGS/{code}.parquet")
@@ -142,7 +142,7 @@ def ensure_features(code: str) -> int:
 
     return int(s.size)
 
-# -------- endpoints de features (mantidos) --------
+# -------- endpoints de features --------
 @app.post("/v1/build_features")
 def build_features_endpoint():
     try:
